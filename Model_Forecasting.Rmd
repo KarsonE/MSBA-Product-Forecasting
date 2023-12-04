@@ -1,0 +1,582 @@
+---
+title: "Prediction Model"
+author: "Karson Eilers"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    theme: spacelab 
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Setup and Configuration
+
+```{r package_setup, message=FALSE}
+library(lubridate)
+library(tidyverse)
+library(ggplot2)
+library(melt)
+library(reshape2)
+library(corrplot)
+library(glmnet)
+library(vars)
+library(Metrics)
+
+```
+
+
+# Introduction & Business Problem
+Maverik, an industry-leading fuel and convenience retailer, partnerered with students in the University of Utah Master of Science in Business Analytics (MSBA) Program to tackle a difficult business problem. As Maverik opens 30 new locations per year, they face the unique challenge of forecasting and evaluating first-year site performance. A more accurate model will enable cost-effective and accurate predictions for first-year sales, which in turn will improve Maverik's financial planning and operations management. 
+
+This document explores the data sample provided by Maverik and utilizes a simple Vector AutoRegression (VAR) model to forecast total annual sales performance given two input timespans (14 days and 21 days). Models will be evaluated using Root Mean Square Error (RMSE). 
+
+
+# Exploratory Data Analysis
+
+## Understanding Target Variables
+Maverik provided two sets of data for modeling. The first file contained sales measures for four metrics across 38 stores. Each store has one year of sales observations (opening day sales + 365 subsequent days). Maverik requested forcasts for each of these variables:
+
+* Unleaded gasoline
+* Diesel fuel
+* Food service 
+* Inside store merchandise
+
+The second data file contains 53 qualitative predictor variables for 37/38 of the stores. The VAR model employed below only uses the four outcome variables, so the exploratory data analysis (EDA) will focus on those four. A few of the qualitative predictor variables will be used to check for significant store outliers that could disproportionately affect the store sales.
+
+
+```{r}
+#imports qualitative dataset
+qual_data <- read.csv("qualitative_data_msba.csv")
+
+#imports time series analysis dataset
+raw_ts <- read.csv('time_series_data_msba.csv')
+
+#imports a few key variables from qualitative data set
+select_qual <- qual_data %>%
+  dplyr::select(
+    "site_id_msba",
+    "square_feet",
+    "parking_spaces",
+    "lottery",
+    "bonfire_grill",
+    "pizza",
+    "ethanol_free",
+    "hi_flow_lanes",
+    "rv_lanes",
+    "def",
+    "rv_dumps",
+  )
+
+#Creates a merged data set, by = site_id_msba by default
+merged_df <- merge(raw_ts,select_qual)
+
+#converting characters to factors and rename column that has a row identifier
+merged_df <- merged_df %>%
+  mutate(across(where(is.character),as.factor)) %>%
+  rename("row_id" = "X")
+
+
+#mean subset generates an average value for across stores for each given date
+mean_subset <- raw_ts %>%
+  dplyr::select('calendar.calendar_day_date',
+         'diesel','unleaded',
+         'daily_yoy_ndt.total_inside_sales',
+         'daily_yoy_ndt.total_food_service') %>%
+  rename('date' = 'calendar.calendar_day_date',
+         'inside_sales' = 'daily_yoy_ndt.total_inside_sales',
+         'food_sales' = 'daily_yoy_ndt.total_food_service'
+         ) %>%
+  group_by(date) %>%
+   mutate(mean_diesel = mean(diesel),
+          mean_unleaded = mean(unleaded),
+          mean_inside_sales = mean(inside_sales),
+          mean_food_sales = mean(food_sales)
+          ) %>%
+   dplyr::select('date','mean_diesel', 'mean_unleaded','mean_inside_sales','mean_food_sales') %>%
+   unique()
+
+#Lengthens the previous subset and converts target variable categories to types in a new field
+lng_avg <- melt(mean_subset, id.vars="date",variable.name="product_type",value.name="average_sales")
+
+# Convert 'date' column to date type
+#lng_avg$date <- as.Date(lng_avg$date, format = "%m/%d/%Y")
+lng_avg$date <- as.Date(lng_avg$date)
+
+
+#Creates a faceted line plot by category
+ggplot(lng_avg, aes(x=ymd(date), y=average_sales)) + geom_point(color="darkblue") + facet_grid(~product_type) + scale_x_date(date_labels="%b %Y",
+               date_breaks = "4 month",
+               guide = guide_axis(angle=45)) +
+  labs(title="Sales by Target Variable Category", y = "Average Daily Sales Volume", x = "Date") + geom_smooth(method=loess) +
+  theme_classic()
+
+```
+
+We start by examining trends in the four outcome variables. The time horizons for the 38 stores do not perfectly align. In total they span approximately 2.5 years. We want to first check for longitudinal sales trends. The values are averaged across stores by sales date. There appear to be clear seasonal trends but not clear long-term trends. The diesel sales appear to be widely distributed, while other measures are more nearly clustered. This could be caused by one or two outlying stores drawing the average up. 
+
+We will take a closer look at the data distributions. The values above display all the outcome variables along the same axis. This shows variation in trends, but the outcome variables are measured in different values (sales vs. dollars) so they should be plotted separately going forward. 
+
+The following two visuals show the density plots for the distributions of the four types of sales. Diesel and gasoline are measured by the same values (sales) and inside store merchandise sales and food service are measured the same way (dollars). The Diesel sales density distribution plot suggests that the high large average values are pulled up by an outlier store. 
+
+```{r sales_distributions, message=FALSE}
+#Data distribution for both types of fuel sales.
+raw_ts %>%
+  dplyr::select("diesel", 
+         "unleaded", ) %>%
+  melt(variable.name = "product_type", value.name = "sales") %>%
+  ggplot(aes(x=sales, color=product_type)) + geom_histogram(fill="white", position="dodge") + labs(title="Daily Sales Distribution by Product Category", x = "Daily Sales")
+
+#Data distribution for both types of inside store sales.
+raw_ts %>%
+  dplyr::select("daily_yoy_ndt.total_inside_sales",
+         "daily_yoy_ndt.total_food_service") %>%
+  rename('inside_sales' = 'daily_yoy_ndt.total_inside_sales',
+         'food_sales' = 'daily_yoy_ndt.total_food_service'
+         ) %>%
+  melt(variable.name = "product_type", value.name = "sales") %>%
+  ggplot(aes(x=sales, color=product_type)) + geom_histogram(fill="white", position="dodge") + labs(title="Daily Sales Distribution by Product Category", x = "Daily Sales")
+
+```
+
+
+## Qualitative Variables
+Next, we will explore some of the structureal parameters of the stores to see whether there are reasons a store sales might be significantly different from the others (e.g., if one store's footprint was twice as large as the others). 
+
+```{r qualitative_summaries}
+# Summarizes store layout values
+qual_data %>%
+  dplyr::select("square_feet",
+         "parking_spaces",
+         "lottery"
+         ) %>%
+  mutate(lottery = as.factor(lottery)) %>%
+  summary()
+
+# Summarizes qual data food variables
+qual_data %>%
+  dplyr::select("freal",
+         "bonfire_grill",
+         "pizza",
+         "cinnabon",
+         "godfather_s_pizza"
+         ) %>%
+  mutate_all(as.factor) %>%
+  summary()
+
+# Summarizes qual data related to fuel stations
+qual_data %>%
+  dplyr::select("ethanol_free",
+         "diesel",
+         "hi_flow_lanes",
+         "rv_lanes",
+         "hi_flow_rv_lanes"
+         ) %>%
+  mutate_all(as.factor) %>%
+  summary()
+
+# Summarizes qual data related to fuel stations
+qual_data %>%
+  dplyr::select("def",
+         "cat_scales",
+         "car_wash",
+         "ev_charging",
+         "rv_dumps",
+         "propane"
+         ) %>%
+  mutate_all(as.factor) %>%
+  summary()
+
+```
+
+There do not appear to be any structural reasons that the outcome variables for some stores would be significantly different than others. The data does not include key factors like the the stores' geographic locations or proximity to major transportation corridor.
+
+Now that we have a better sense of the data, we will proceed to the modeling step. 
+
+# Modeling
+
+## Partitioning
+
+The first step in modeling is to select the variables we need and partition the data into a train and test set. We have 38 total stores, 80% of which need to be assigned to the training set and 20% into a test set. We do this by selecting unique store IDs and assigning them randomly. This results in a 30-store training set and an 8-store testing set. The purpose behind training and testing is so we can verify how the model performs when it is introduced to new data. 
+
+```{r VAR, echo=FALSE, message=FALSE, results=FALSE}
+#imports time series dataset
+ts_data <- read_csv('time_series_data_msba.csv')
+
+#Create column that shows the number of days the store has been open
+ts_data <- ts_data %>%
+  mutate(Days_Since_Open = as.numeric(calendar.calendar_day_date - capital_projects.soft_opening_date))
+
+#Creates a subset with only sales values
+ts_data <- ts_data %>%
+  dplyr::select(Days_Since_Open,
+         daily_yoy_ndt.total_food_service,
+         daily_yoy_ndt.total_inside_sales,
+         diesel,
+         unleaded,
+         site_id_msba)
+
+
+#SITE IDs 
+set.seed(123)
+
+#Selects distinct site ids for train/test split
+distinct_sites <- ts_data %>%
+  distinct(site_id_msba)
+
+#samples 30 (~80%) site ids to construct the training sample
+train_sites <- slice_sample(distinct_sites, n=30, replace=FALSE)
+
+#constructs the train & test sets based on sampled ids
+train_set <- filter(ts_data, site_id_msba %in% train_sites$site_id_msba)
+test_set <- filter(ts_data, !site_id_msba %in% train_sites$site_id_msba)
+
+#Removes site IDs from the dataset
+train_set <- train_set %>%
+  dplyr::select(-site_id_msba)
+test_set <-test_set %>%
+  dplyr::select(-site_id_msba)
+
+#Building VAR training set on average daily value set
+train_set <- train_set %>%
+  group_by(Days_Since_Open) %>%
+  summarize(daily_food_service = mean(daily_yoy_ndt.total_food_service),
+            daily_inside_sales = mean(daily_yoy_ndt.total_inside_sales),
+            daily_diesel = mean(diesel),
+            daily_unleaded = mean(unleaded))
+
+#Building VAR test set on average daily value set
+test_set <- test_set %>%
+  group_by(Days_Since_Open) %>%
+  summarize(daily_food_service = mean(daily_yoy_ndt.total_food_service),
+            daily_inside_sales = mean(daily_yoy_ndt.total_inside_sales),
+            daily_diesel = mean(diesel),
+            daily_unleaded = mean(unleaded))
+
+#Removes Days_Since_Open index from train and test sets
+train_set <- train_set %>%
+  dplyr::select(-Days_Since_Open)
+test_set <- test_set %>%
+  dplyr::select(-Days_Since_Open)
+
+```
+
+Now that we the data partitioned, we convert both the training and testing sets to time series variables indexed for each store on the number of days open (e.g., day 0 through day 365). Next, the model is trained. 
+
+The VAR model is multivariate time series which allows us to measure how multiple endogenous variables change together over time. It does this by regressing each of the endogenous variables against 1 specified lag of the other variables. In this case, the model uses a one-day lag. In other words, the model captures the aggregate effect of the prior day outcome variables. The VAR model can utilize exogenous predictor variables as well, so why were the qualitative variables excluded from the model? There are two reasons for this decision:
+
+* First, not all predictor variables are meaningfully related to each of the respective outcome variables. VAR does not allow us to individually select the features that matter for a given model. 
+
+* Second, Maverik operates stores in a variety of regions and even states throughout the Intermountain West. Varying climates and regulatory regimes could significantly impact a fine-tuned model's predictive ability. For example, if Maverik opened a store in southern California, the store would likely be less influenced by seasonality than a store in a mountainous community in Utah. A Maverik in California could also sell a wider variety of products (e.g., wine, liquour, lottery tickets) and a store in Utah cannot. This could have a distortionary effect on merchandise sales if the training set only included Utah stores and the model would perform poorly when applied elsewhere. This model functions on any store that sells unleaded gasoline, diesel, food service, and store merchandise. 
+
+
+The multiple R^2 values range amongst the individual outcome variable regressors from 0.49 to 0.75 meaning the individual models are able to explain between 49% and 75% of the variation in the data depending on the outcome variable. Specific performance metrics will be calculated below.
+
+
+```{r var2}
+#Converts train and test sets to time series values
+train_ts <- ts(train_set, start=1, frequency=1)
+test_ts <- ts(test_set, start=1, frequency=1)
+
+#Trains the VAR model on the training dataset using only endogenous values and a 1-day lag
+var_model <- VAR(train_ts, p=1)
+
+#Summarizes the model coefficients
+#Summary supressed for readability
+#summary(var_model)
+
+```
+
+Now that we have the model trained, it's time to use it to calculate predictions. For Maverik's specific purposes, the model needs to be flexible enough to predict on any given timespan between 1 and 365. To do this, we write two custom functions instead using a pre-build package like Caret. The first function creats a prediction for a given day. The second function uses the first to aggregate the predictions. This function can also take any given VAR model that meets the same parameters, so the same code could be deployed on a training set that spans multiple years. 
+
+```{r var3}
+#Creates two methods to calculate predicted values based on model values
+
+#Var_predict (VAR prediction method) to calculate sales values
+  ## model = model selection
+  ## last_obs = last observed values (ordered by 1: food service; 2: inside sales; 3: diesel; 4: unleaded)
+  ## type = target prediction
+
+var_predict <- function(model, last_obs) {
+    #Calculates food service sales
+    fs <- model$varresult$daily_food_service$coefficients[[1]]*last_obs[1]
+    is <- model$varresult$daily_food_service$coefficients[[2]]*last_obs[2]
+    ds <- model$varresult$daily_food_service$coefficients[[3]]*last_obs[3]
+    du <- model$varresult$daily_food_service$coefficients[[4]]*last_obs[4]
+    intercept <- model$varresult$daily_food_service$coefficients[[5]]
+    food_service_pred <- fs + is + ds + du + intercept
+    #Calculates inside sales
+    fs <- model$varresult$daily_inside_sales$coefficients[[1]]*last_obs[1]
+    is <- model$varresult$daily_inside_sales$coefficients[[2]]*last_obs[2]
+    ds <- model$varresult$daily_inside_sales$coefficients[[3]]*last_obs[3]
+    du <- model$varresult$daily_inside_sales$coefficients[[4]]*last_obs[4]
+    intercept <- model$varresult$daily_inside_sales$coefficients[[5]]
+    inside_sales_pred <- fs + is + ds + du + intercept
+    #Calculates diesel sales
+    fs <- model$varresult$daily_diesel$coefficients[[1]]*last_obs[1]
+    is <- model$varresult$daily_diesel$coefficients[[2]]*last_obs[2]
+    ds <- model$varresult$daily_diesel$coefficients[[3]]*last_obs[3]
+    du <- model$varresult$daily_diesel$coefficients[[4]]*last_obs[4]
+    intercept <- model$varresult$daily_diesel$coefficients[[5]]
+    diesel_pred <- fs + is + ds + du + intercept
+    #Calculates Unleaded Gasoline sales
+    fs <- model$varresult$daily_unleaded$coefficients[[1]]*last_obs[1]
+    is <- model$varresult$daily_unleaded$coefficients[[2]]*last_obs[2]
+    ds <- model$varresult$daily_unleaded$coefficients[[3]]*last_obs[3]
+    du <- model$varresult$daily_unleaded$coefficients[[4]]*last_obs[4]
+    intercept <- model$varresult$daily_unleaded$coefficients[[5]]
+    unleaded_pred <- fs + is + ds + du + intercept
+    return(c(food_service_pred, inside_sales_pred, diesel_pred, unleaded_pred))
+}
+
+#Method VAR forecast utilized var_predict to form aggregate forecasts
+  ##model_input = model to pass through to var_predict
+  ##start_vals = the most recent day's observation, takes a vector or list of four numbers
+  ##num_days = the number of days to forecast
+var_forecast <- function(model_input, start_vals, num_days) {
+  #creates a new data set to store values and return
+  new_df <- data.frame(food_service = start_vals[1],
+                       inside_sales = start_vals[2],
+                       diesel_sales = start_vals[3],
+                       unleaded_sales = start_vals[4]
+                       )
+  #stores baseline (day n) prediction in the dataframe
+  new_pred <- var_predict(model=model_input, last_obs=as.numeric(new_df[1,1:4]))
+    temp_df <- data.frame(food_service = new_pred[1],
+                       inside_sales = new_pred[2],
+                       diesel_sales = new_pred[3],
+                       unleaded_sales = new_pred[4])
+    new_df <- rbind(new_df, temp_df)
+  
+  #iterates through length of days specified making predictions on 1-day prior observations
+  for (i in 2:num_days) {
+    new_pred <- var_predict(model=model_input, last_obs=as.numeric(new_df[i-1,1:4]))
+    temp_df <- data.frame(food_service = new_pred[1],
+                       inside_sales = new_pred[2],
+                       diesel_sales = new_pred[3],
+                       unleaded_sales = new_pred[4])
+    #attaches day n predictions to datagrame
+    new_df <- rbind(new_df, temp_df)
+  }
+  #returns the new df with predictions
+  return(new_df)
+}
+
+
+```
+
+# Results
+
+The training and testing set dataframes were modified in the modeling stages, so they are reset. The calculate performance we need another function that can plug in the previous prediction function and calculate the root mean square error (RMSE) over the course of a year compared to the actual events in the test set. The RMSE calculator also need to be able to vary in time span.
+
+```{r results1}
+set.seed(123)
+
+#Resets training sites
+train_sites <- slice_sample(distinct_sites, n=30, replace=FALSE)
+
+#constructs the train & test sets based on sampled ids
+train_set <- filter(ts_data, site_id_msba %in% train_sites$site_id_msba)
+test_set <- filter(ts_data, !site_id_msba %in% train_sites$site_id_msba)
+
+#Wrapper for predictions
+test_set_IDs <- test_set %>%
+  distinct(site_id_msba)
+
+#Creates a new function to calculate the total annual RMSE from the VAR predictions for any given start day, up to 1 year.
+##start_day is the initial day to make the predictions from
+##site_ids are the sites to apply from
+##test data is the test_set with the actual values to base initial predictions (e.g., day 0, 14, 21) on and compare against
+calc_rmse <- function(start_day, site_ids, test_data) {
+  
+  #each vector stores either predictions or actuals from the provided input data
+  site_id_index <- c()
+  diesel_predictions <- c()
+  actual_diesel <- c()
+  unleaded_predictions <- c()
+  actual_unleaded <- c()
+  inside_store_predictions <- c()
+  actual_inside_store <- c()
+  food_service_predictions <- c()
+  actual_food_service <- c()
+  
+  #for loop iterates through each site and makes predictions on it for the provided number of days
+  for (i in as.vector(site_ids$site_id_msba)) {
+    site <- i
+    tempDF <- test_data %>%
+      filter(site_id_msba == site) %>%
+      dplyr::select(-site_id_msba) %>%
+      arrange(Days_Since_Open)
+    
+    #predictions are stored in a temporary df
+    tempDF <- tempDF %>% rename(
+      "food_service" = "daily_yoy_ndt.total_food_service",
+      "inside_sales" = "daily_yoy_ndt.total_inside_sales",
+      "diesel_sales" = "diesel",
+      "unleaded_sales" = "unleaded"
+    )
+    
+    tempDF <- tempDF %>%
+      dplyr::select(-Days_Since_Open)
+  
+    #forecast model applied here to the specific testing sites and number of days
+    test_preds <- var_forecast(var_model, as.numeric(tempDF[(start_day+1), 1:4]), (365-(start_day)))
+    
+    #adds the remaining not predicted days (e.g, day 0, days 0-14, days 0-21) to the predictions
+    test_preds <- dplyr::bind_rows(test_preds, tempDF[1:(start_day-1),])
+    
+    #stores annual sum predictions by outcome variable
+    unleaded_sum <- sum(test_preds[,4])
+    diesel_sum <- sum(test_preds[,3])
+    inside_sales_sum <- sum(test_preds[,2])
+    food_service_sum <- sum(test_preds[,1])
+    
+    #stores annual sum actual values by outcome variable
+    actual_unleaded_sum <- sum(tempDF[,4])
+    actual_diesel_sum <- sum(tempDF[,3])
+    actual_inside_sales_sum <- sum(tempDF[,2])
+    actual_food_service_sum <- sum(tempDF[,1])
+    
+    #indexes by site id
+    site_id_index <- append(site_id_index, site)
+    
+    #adds new values the predicted or actual diesel series
+    diesel_predictions <- append(diesel_predictions, diesel_sum)
+    actual_diesel <- append(actual_diesel, actual_diesel_sum)
+    
+    #adds new values the predicted or actual unleaded series
+    unleaded_predictions <- append(unleaded_predictions, unleaded_sum)
+    actual_unleaded <- append(actual_unleaded, actual_unleaded_sum)
+    
+    #adds new values the predicted or actual merchandise series
+    inside_store_predictions <- append(inside_store_predictions, inside_sales_sum)
+    actual_inside_store <- append(actual_inside_store, actual_inside_sales_sum)
+    
+    #adds new values to the predicted or actual food service series
+    food_service_predictions <- append(food_service_predictions, food_service_sum)
+    actual_food_service <- append(actual_food_service, actual_food_service_sum)
+  }
+  
+
+  #comine reults into a single dataframe
+  resultsDF <- data.frame(cbind(site_id_index,
+                                food_service_predictions,
+                                actual_food_service,
+                                inside_store_predictions,
+                                actual_inside_store,
+                                diesel_predictions,
+                                actual_diesel,
+                                unleaded_predictions,
+                                actual_unleaded
+                                ))
+  
+  #returns the aggregated DF
+  return(resultsDF)
+  
+}
+
+```
+
+The baseline metrics given for Maverik's current model were provided for a two- and three-week input time span, meaning the model estimates annual performance based on 14 days and 21 days of input data, respectively. 
+
+```{r results2}
+
+#predicts annual sales based on two weeks of data for each store in the test set
+preds2WK <- calc_rmse(14, test_set_IDs, test_set)
+
+#predicts annual sales based on three weeks of data for each store in the test set
+preds3WK <- calc_rmse(21, test_set_IDs, test_set)
+
+#the following outputs calculate aggregate RMSE for each outcome variable in both time horizons
+paste("unleaded 2wk:", rmse(preds2WK$actual_unleaded, preds2WK$unleaded_predictions))
+paste("unleaded 3wk: ", rmse(preds3WK$actual_unleaded, preds3WK$unleaded_predictions))
+paste("diesel 2wk: ", rmse(preds2WK$actual_diesel, preds2WK$diesel_predictions))
+paste("diesel 3wk: ", rmse(preds3WK$actual_diesel, preds3WK$diesel_predictions))
+paste("food service 2wk: ", rmse(preds2WK$actual_food_service, preds2WK$food_service_predictions))
+paste("food service 3wk: ", rmse(preds3WK$actual_food_service, preds3WK$food_service_predictions))
+paste("inside store sales 2wk: ", rmse(preds2WK$actual_inside_store, preds2WK$inside_store_predictions))
+paste("inside store sales 3wk: ", rmse(preds3WK$actual_inside_store, preds3WK$inside_store_predictions))
+
+
+```
+
+## Perfomance Table (RMSE)
+
+| Category | Unleaded | Diesel | Food service | Inside store sales |
+|----------|----------|----------|--------------|--------------------|
+|VAR 2 week| 198,681 | 1,309,861 | 115,924|306,820|
+|Baseline 2 week| 302,827 | 558,546 | 68,860 | 268,521 |
+|VAR 3 week| 202,672 | 1,288,706 | 110,661 | 291,723 |
+|Baseline 3 week| 259,909 | 482,976 | 66,252 | 243,858 |
+
+The results table above shows that the model outperformed the baseline model for unleaded gasoline sales. It performed slightly worse for food service sales and inside store sales. Diesel sales are considerably worse. The predictions are plotted below to better explain why. 
+
+## Model Performance Visualizations
+
+```{r model_plots}
+test_set <- filter(ts_data, !site_id_msba %in% train_sites$site_id_msba)
+
+#creates a simulated store based on average 'day 0' values from the test set to make predictions for
+test_avg <- test_set %>%
+  filter(test_set$Days_Since_Open == 0) %>%
+  colMeans()
+
+#new df stores predictions from the VAR forcast
+preds_avg <- var_forecast(var_model, test_avg[2:5], 365)
+
+#resets df index
+row.names(preds_avg) <- NULL
+
+#incorporates the days_since_open for the predicted values
+preds_avg$Days_Since_Open <- 1:nrow(preds_avg)
+
+#creates new field to distinguish predicted values from actual in the merge
+preds_avg$type <- "Predicted"
+test_set$type <- "Actual"
+
+#drops site id from the dataset prior to the merge
+test_set <- test_set %>%
+  dplyr::select(-"site_id_msba")
+
+#renames test_set features to match prediction feature names
+test_set <- test_set %>% 
+  rename("food_service" = "daily_yoy_ndt.total_food_service",
+         "inside_sales" = "daily_yoy_ndt.total_inside_sales",
+         "diesel_sales" = "diesel",
+         "unleaded_sales" = "unleaded"
+         )
+#reorders columns to match features for merge
+preds_avg <- preds_avg[, c("Days_Since_Open", "food_service", "inside_sales", "diesel_sales", "unleaded_sales", "type")]
+
+#merges predictions and actual observations
+test_set <- rbind(preds_avg, test_set)
+
+#Unleaded Plot
+ggplot(data=test_set, aes(x=Days_Since_Open, y=unleaded_sales, color=type)) + geom_point() + xlab("Days Since Open") + ylab("Unleaded Gasoline Sales") + scale_color_manual(values=c("grey","red")) + ggtitle("Unleaded Gasoline Sales - Predicted vs. Actual")
+
+#Diesel Plot
+ggplot(data=test_set, aes(x=Days_Since_Open, y=diesel_sales, color=type)) + geom_point() + xlab("Days Since Open") + ylab("Diesel Sales") + scale_color_manual(values=c("grey","red")) + ggtitle("Diesel Sales - Predicted vs. Actual")
+
+#Inside Sales Plot
+ggplot(data=test_set, aes(x=Days_Since_Open, y=inside_sales, color=type)) + geom_point() + xlab("Days Since Open") + ylab("Inside Store Sales") + scale_color_manual(values=c("grey","red")) + ggtitle("Inside Store (Merchandise) Sales - Predicted vs. Actual")
+
+#Food Service Plot
+ggplot(data=test_set, aes(x=Days_Since_Open, y=food_service, color=type)) + geom_point() + xlab("Days Since Open") + ylab("Food Service Sales") + scale_color_manual(values=c("grey","red")) + ggtitle("Food Service Sales - Predicted vs. Actual")
+
+
+```
+
+## Conclusions
+The visuals above show some similarity in how the four models function; namely that there is some volatility in the initial days as the stores become established. Over time, though, the models show that the store values stabilize and approach the central tendency in the data. It is intuitive that the models tend to predict well in the aggregate - as days increase store performance balances out. The diesel sales plot also shows why that particular metric has such a high RMSE. The plot indicates that one store provides significant variance. So, while the model is similar to <i>most</i> of the data, one store introduces enough variance to drive a much higher standard error. A better RMSE could likely be achieved by excluding that one outlying store, however, it is important that the model can encounter outlying stores. The model will likly improve as it is trained on more data which includes outlying stores so it can better account for them. 
+
+
+In conclusion, the VAR model provides a solid, generalizable tool for Maverik to use as they bring more and more stores online each year. The model can quickly be deployed on new training data and with a few parameter tweaks can easily be adapted to longer time horizons. Additionally, the model is very resource-effective and can be trained and deployed quickly. The day lags are produced within the model so it doesn't require any resource intensive feature engineering or pre-processing either. While it is not as precise as some more resource-intensive models, the benefits explained above demonstrative is comparable usefulness and value.
+
+
+
+
+
+
